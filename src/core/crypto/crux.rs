@@ -127,13 +127,17 @@ impl DataEncrypter<MultipleEncryptionDataGroup> for MultipleDecryptionDataGroup 
         let key = GcmAes256::new(decrypted_key.key)?;
         let key_version = decrypted_key.version;
 
+        let total_groups = self.0.len();
+        let num_threads = state.thread_pool.current_num_threads();
+        let chunk_size = std::cmp::max(total_groups / num_threads, 1);
+
         let encrypted_groups = state.thread_pool.install(|| {
             self.0
-                .into_par_iter()
-                .map(|decrypted_group| {
-                    let encrypted_entries = decrypted_group
-                        .0
-                        .into_par_iter()
+                .par_chunks(chunk_size)
+                .map(|decrypted_group_chunk| {
+                    let encrypted_entries = decrypted_group_chunk
+                        .par_iter()
+                        .flat_map(|decrypted_group| decrypted_group.0.clone().into_par_iter())
                         .map(|(hash_key, data)| {
                             let encrypted_data = key.encrypt(data.inner())?;
                             Ok::<_, error_stack::Report<errors::CryptoError>>((
@@ -183,13 +187,18 @@ impl DataDecrypter<MultipleDecryptionDataGroup> for MultipleEncryptionDataGroup 
             );
         }
 
+        let total_groups = self.0.len();
+        let num_threads = state.thread_pool.current_num_threads();
+        let chunk_size = std::cmp::max(total_groups / num_threads, 1);
+
+
         let decrypted_groups = state.thread_pool.install(|| {
             self.0
-                .into_par_iter()
+                .par_chunks(chunk_size)
                 .map(|encrypted_group| {
                     let decrypted_entries = encrypted_group
-                        .0
-                        .into_par_iter()
+                        .par_iter()
+                        .flat_map(|encrypted_group| encrypted_group.0.clone().into_par_iter())
                         .map(|(hash_key, data)| {
                             let version = data.version;
                             let decrypted_key = decrypted_keys.get(&version).ok_or(
