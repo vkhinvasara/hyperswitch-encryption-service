@@ -11,7 +11,8 @@ use crate::{
     multitenancy::TenantState,
     storage::types::{DataKey, DataKeyNew},
     types::{
-        key::Version, DecryptedData, DecryptedDataGroup, EncryptedData, EncryptedDataGroup, Identifier, Key, MultipleDecryptionDataGroup, MultipleEncryptionDataGroup
+        key::Version, DecryptedData, DecryptedDataGroup, EncryptedData, EncryptedDataGroup,
+        Identifier, Key, MultipleDecryptionDataGroup, MultipleEncryptionDataGroup,
     },
 };
 
@@ -127,30 +128,40 @@ impl DataEncrypter<MultipleEncryptionDataGroup> for MultipleDecryptionDataGroup 
         let key = GcmAes256::new(decrypted_key.key)?;
         let key_version = decrypted_key.version;
 
+        let total_groups = self.0.len();
+        let num_threads = state.thread_pool.current_num_threads();
+        let chunk_size = std::cmp::max(total_groups / num_threads, 1);
+
         let encrypted_groups = state.thread_pool.install(|| {
             self.0
                 .into_par_iter()
-                .map(|decrypted_group| {
-                    let encrypted_entries = decrypted_group
-                        .0
-                        .into_par_iter()
-                        .map(|(hash_key, data)| {
-                            let encrypted_data = key.encrypt(data.inner())?;
-                            Ok::<_, error_stack::Report<errors::CryptoError>>((
-                                hash_key,
-                                EncryptedData {
-                                    version: key_version,
-                                    data: encrypted_data,
-                                },
-                            ))
+                .chunks(chunk_size)
+                .map(|d| {
+                    d
+                    .into_par_iter()
+                        .map(|decrypted_group| {
+                            let encrypted_entries = decrypted_group
+                                .0
+                                .into_par_iter()
+                                .map(|(hash_key, data)| {
+                                    let encrypted_data = key.encrypt(data.inner())?;
+                                    Ok::<_, error_stack::Report<errors::CryptoError>>((
+                                        hash_key,
+                                        EncryptedData {
+                                            version: key_version,
+                                            data: encrypted_data,
+                                        },
+                                    ))
+                                })
+                                .collect::<errors::CustomResult<FxHashMap<String, EncryptedData>, errors::CryptoError>>()?;
+                            Ok(EncryptedDataGroup(encrypted_entries))
                         })
-                        .collect::<errors::CustomResult<FxHashMap<_, _>, _>>()?;
-                    Ok(EncryptedDataGroup(encrypted_entries))
+                        .collect::<errors::CustomResult<Vec<_>, _>>()
                 })
-                .collect::<errors::CustomResult<Vec<_>, _>>()
-        })?;
+                .collect::<errors::CustomResult<Vec<_>, _>>()?
+        });
 
-        Ok(MultipleEncryptionDataGroup(encrypted_groups))
+        Ok(MultipleEncryptionDataGroup(encrypted_groups.iter().map(f)))
     }
 }
 
@@ -174,13 +185,8 @@ impl DataDecrypter<MultipleDecryptionDataGroup> for MultipleEncryptionDataGroup 
 
         if identifier.is_entity() {
             let provided_token = custodian.into_access_token(state);
-            let all_tokens_match = decrypted_keys
-                .values()
-                .all(|k| k.token.eq(&provided_token));
-            ensure!(
-                all_tokens_match,
-                errors::CryptoError::AuthenticationFailed
-            );
+            let all_tokens_match = decrypted_keys.values().all(|k| k.token.eq(&provided_token));
+            ensure!(all_tokens_match, errors::CryptoError::AuthenticationFailed);
         }
 
         let decrypted_groups = state.thread_pool.install(|| {
